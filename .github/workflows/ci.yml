@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (go ${{ matrix.go }}, GOMAXPROCS=${{ matrix.gomaxprocs }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Oldest supported (go.mod directive) and current stable.
+        go: ["1.22", "stable"]
+        # Vary the scheduler: single-threaded vs multi-core exposes
+        # ordering assumptions the race detector alone cannot.
+        gomaxprocs: ["1", "4"]
+    env:
+      GOMAXPROCS: ${{ matrix.gomaxprocs }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test -race
+        run: go test -race -count=1 ./...
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write # post the coverage comment
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - name: Run tests with coverage
+        run: go test -race -count=1 -covermode=atomic -coverprofile=cover.out ./...
+
+      - name: Build coverage report
+        run: |
+          go tool cover -func=cover.out | tee coverage.txt
+          total=$(awk '/^total:/ {sub(/%/, "", $3); print $3}' coverage.txt)
+          echo "Total coverage: ${total}%"
+          echo "COVERAGE_TOTAL=${total}" >> "$GITHUB_ENV"
+          # Per-function table for the PR comment and job summary.
+          {
+            echo "<!-- coverage-report -->"
+            echo "### Coverage: ${total}%"
+            echo ""
+            echo "<details><summary>Per-function coverage</summary>"
+            echo ""
+            echo '```'
+            cat coverage.txt
+            echo '```'
+            echo ""
+            echo "</details>"
+          } > coverage-comment.md
+          cat coverage-comment.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment coverage on PR
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('coverage-comment.md', 'utf8');
+            const marker = '<!-- coverage-report -->';
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const { data: comments } = await github.rest.issues.listComments({ owner, repo, issue_number });
+            const existing = comments.find(c => c.user.type === 'Bot' && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+      - name: Upload coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            cover.out
+            coverage.txt
+          retention-days: 14
+
+      - name: Coverage gate
+        env:
+          # Fail the job if total statement coverage drops below this.
+          THRESHOLD: "90"
+        run: |
+          awk -v t="$COVERAGE_TOTAL" -v min="$THRESHOLD" 'BEGIN { exit (t+0 < min+0) ? 1 : 0 }' \
+            || { echo "::error::coverage ${COVERAGE_TOTAL}% is below threshold ${THRESHOLD}%"; exit 1; }
